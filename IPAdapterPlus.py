@@ -1,10 +1,8 @@
 import torch
-import contextlib
 import os
 
 import comfy.utils
 import comfy.model_management
-from comfy.clip_vision import clip_preprocess
 from comfy.ldm.modules.attention import optimized_attention
 import folder_paths
 
@@ -14,6 +12,7 @@ import torch.nn.functional as F
 import torchvision.transforms as TT
 
 from .resampler import Resampler
+from .util import contrast_adaptive_sharpening, zeroed_hidden_states, image_add_noise
 
 # set the models directory backward compatible
 GLOBAL_MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter")
@@ -75,90 +74,6 @@ def set_model_patch_replace(model, patch_kwargs, key):
     else:
         to["patches_replace"]["attn2"][key].set_new_condition(**patch_kwargs)
 
-def image_add_noise(image, noise):
-    image = image.permute([0,3,1,2])
-    torch.manual_seed(0) # use a fixed random for reproducible results
-    transforms = TT.Compose([
-        TT.CenterCrop(min(image.shape[2], image.shape[3])),
-        TT.Resize((224, 224), interpolation=TT.InterpolationMode.BICUBIC, antialias=True),
-        TT.ElasticTransform(alpha=75.0, sigma=noise*3.5), # shuffle the image
-        TT.RandomVerticalFlip(p=1.0), # flip the image to change the geometry even more
-        TT.RandomHorizontalFlip(p=1.0),
-    ])
-    image = transforms(image.cpu())
-    image = image.permute([0,2,3,1])
-    image = image + ((0.25*(1-noise)+0.05) * torch.randn_like(image) )   # add further random noise
-    return image
-
-def zeroed_hidden_states(clip_vision, batch_size):
-    image = torch.zeros([batch_size, 224, 224, 3])
-    comfy.model_management.load_model_gpu(clip_vision.patcher)
-    pixel_values = clip_preprocess(image.to(clip_vision.load_device))
-
-    if clip_vision.dtype != torch.float32:
-        precision_scope = torch.autocast
-    else:
-        precision_scope = lambda a, b: contextlib.nullcontext(a)
-
-    with precision_scope(comfy.model_management.get_autocast_device(clip_vision.load_device), torch.float32):
-        outputs = clip_vision.model(pixel_values, output_hidden_states=True)
-
-    # we only need the penultimate hidden states
-    outputs = outputs['hidden_states'][-2].cpu() if 'hidden_states' in outputs else None
-
-    return outputs
-
-def min_(tensor_list):
-    # return the element-wise min of the tensor list.
-    x = torch.stack(tensor_list)
-    mn = x.min(axis=0)[0]
-    return torch.clamp(mn, min=0)
-    
-def max_(tensor_list):
-    # return the element-wise max of the tensor list.
-    x = torch.stack(tensor_list)
-    mx = x.max(axis=0)[0]
-    return torch.clamp(mx, max=1)
-
-# From https://github.com/Jamy-L/Pytorch-Contrast-Adaptive-Sharpening/
-def contrast_adaptive_sharpening(image, amount):
-    img = F.pad(image, pad=(1, 1, 1, 1)).cpu()
-
-    a = img[..., :-2, :-2]
-    b = img[..., :-2, 1:-1]
-    c = img[..., :-2, 2:]
-    d = img[..., 1:-1, :-2]
-    e = img[..., 1:-1, 1:-1]
-    f = img[..., 1:-1, 2:]
-    g = img[..., 2:, :-2]
-    h = img[..., 2:, 1:-1]
-    i = img[..., 2:, 2:]
-    
-    # Computing contrast
-    cross = (b, d, e, f, h)
-    mn = min_(cross)
-    mx = max_(cross)
-    
-    diag = (a, c, g, i)
-    mn2 = min_(diag)
-    mx2 = max_(diag)
-    mx = mx + mx2
-    mn = mn + mn2
-    
-    # Computing local weight
-    inv_mx = torch.reciprocal(mx)
-    amp = inv_mx * torch.minimum(mn, (2 - mx))
-
-    # scaling
-    amp = torch.sqrt(amp)
-    w = - amp * (amount * (1/5 - 1/8) + 1/8)
-    div = torch.reciprocal(1 + 4*w)
-
-    output = ((b + d + f + h)*w + e) * div
-    output = output.clamp(0, 1)
-    output = torch.nan_to_num(output)
-
-    return (output)
 
 class IPAdapter(nn.Module):
     def __init__(self, ipadapter_model, cross_attention_dim=1024, output_cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4, is_sdxl=False, is_plus=False, is_full=False):
@@ -210,7 +125,7 @@ class IPAdapter(nn.Module):
 
 class CrossAttentionPatch:
     # forward for patching
-    def __init__(self, weight, ipadapter, device, dtype, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
+    def __init__(self, weight, ipadapter, device, dtype, number, cond, uncond, weight_type, sigma_start=0.0, sigma_end=1.0, attn_group=0):
         self.weights = [weight]
         self.ipadapters = [ipadapter]
         self.conds = [cond]
@@ -219,88 +134,74 @@ class CrossAttentionPatch:
         self.dtype = dtype if 'cuda' in self.device else torch.bfloat16
         self.number = number
         self.weight_type = [weight_type]
-        self.masks = [mask]
         self.sigma_start = [sigma_start]
         self.sigma_end = [sigma_end]
-        self.unfold_batch = [unfold_batch]
-
         self.k_key = str(self.number*2+1) + "_to_k_ip"
         self.v_key = str(self.number*2+1) + "_to_v_ip"
+        self.groups = [attn_group]
     
-    def set_new_condition(self, weight, ipadapter, device, dtype, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
+    def set_new_condition(self, weight, ipadapter, device, dtype, number, cond, uncond, weight_type, sigma_start=0.0, sigma_end=1.0, attn_group=0):
         self.weights.append(weight)
         self.ipadapters.append(ipadapter)
         self.conds.append(cond)
         self.unconds.append(uncond)
-        self.masks.append(mask)
         self.device = 'cuda' if 'cuda' in device.type else 'cpu'
         self.dtype = dtype if 'cuda' in self.device else torch.bfloat16
         self.weight_type.append(weight_type)
         self.sigma_start.append(sigma_start)
         self.sigma_end.append(sigma_end)
-        self.unfold_batch.append(unfold_batch)
+        self.groups.append(attn_group)
 
     def __call__(self, n, context_attn2, value_attn2, extra_options):
         org_dtype = n.dtype
         cond_or_uncond = extra_options["cond_or_uncond"]
         sigma = extra_options["sigmas"][0].item() if 'sigmas' in extra_options else 999999999.9
 
-        # extra options for AnimateDiff
-        ad_params = extra_options['ad_params'] if "ad_params" in extra_options else None
-
         with torch.autocast(device_type=self.device, dtype=self.dtype):
+            # create a list of adapters that need to be applied
+            tasks = list(zip(self.weights, self.conds, self.unconds,
+                        self.ipadapters, self.weight_type,
+                        self.sigma_start, self.sigma_end, self.groups))
+            # now filter out tasks that are not in the sigma range
+            tasks = [task for task in tasks if sigma <= task[5] and sigma >= task[6]]
+            # sort tasks by groups, so that once each group is done we can call crossattention and free memory
+            tasks.sort(key=lambda x: x[7])
+            # get the last index of each group
+            group_end_indices = [i for i, x in enumerate(tasks[:-2]) if x[7] != tasks[i+1][7]] + [len(tasks)-1]
+
             q = n
-            k = context_attn2
-            v = value_attn2
-            b = q.shape[0]
-            qs = q.shape[1]
-            batch_prompt = b // len(cond_or_uncond)
-            out = optimized_attention(q, k, v, extra_options["n_heads"])
-            _, _, lh, lw = extra_options["original_shape"]
-            
-            for weight, cond, uncond, ipadapter, mask, weight_type, sigma_start, sigma_end, unfold_batch in zip(self.weights, self.conds, self.unconds, self.ipadapters, self.masks, self.weight_type, self.sigma_start, self.sigma_end, self.unfold_batch):
-                if sigma > sigma_start or sigma < sigma_end:
-                    continue
+            k = []
+            v = []
+            b = q.shape[0] // len(cond_or_uncond)
+            out = 0
 
-                if unfold_batch and cond.shape[0] > 1:
-                    # Check AnimateDiff context window
-                    if ad_params is not None and ad_params["sub_idxs"] is not None:
-                        # if images length matches or exceeds full_length get sub_idx images
-                        if cond.shape[0] >= ad_params["full_length"]:
-                            cond = torch.Tensor(cond[ad_params["sub_idxs"]])
-                            uncond = torch.Tensor(uncond[ad_params["sub_idxs"]])
-                        # otherwise, need to do more to get proper sub_idxs masks
-                        else:
-                            # check if images length matches full_length - if not, make it match
-                            if cond.shape[0] < ad_params["full_length"]:
-                                cond = torch.cat((cond, cond[-1:].repeat((ad_params["full_length"]-cond.shape[0], 1, 1))), dim=0)
-                                uncond = torch.cat((uncond, uncond[-1:].repeat((ad_params["full_length"]-uncond.shape[0], 1, 1))), dim=0)
-                            # if we have too many remove the excess (should not happen, but just in case)
-                            if cond.shape[0] > ad_params["full_length"]:
-                                cond = cond[:ad_params["full_length"]]
-                                uncond = uncond[:ad_params["full_length"]]
-                            cond = cond[ad_params["sub_idxs"]]
-                            uncond = uncond[ad_params["sub_idxs"]]
+            # if text is separate from image, do the text group first
+            if tasks[0][7] != 0:
+                out = optimized_attention(q, context_attn2, value_attn2, extra_options["n_heads"])
+            else:
+                k = [context_attn2]
+                v = [value_attn2]
 
-                    # if we don't have enough reference images repeat the last one until we reach the right size
-                    if cond.shape[0] < batch_prompt:
-                        cond = torch.cat((cond, cond[-1:].repeat((batch_prompt-cond.shape[0], 1, 1))), dim=0)
-                        uncond = torch.cat((uncond, uncond[-1:].repeat((batch_prompt-uncond.shape[0], 1, 1))), dim=0)
-                    # if we have too many remove the exceeding
-                    elif cond.shape[0] > batch_prompt:
-                        cond = cond[:batch_prompt]
-                        uncond = uncond[:batch_prompt]
+            for i, (weight, cond, uncond, ipadapter, weight_type, _, _, group) in enumerate(tasks):
+                # cond = (n_images, n_tokens, d_clip)
+                # we want to reshape to (1, n_images*n_tokens, d_clip)
+                (ni, nt, _) = cond.shape
+                cond = cond.reshape(1, -1, cond.shape[-1])
+                uncond = uncond.reshape(1, -1, uncond.shape[-1])
+                # we also need to reshape the weight, which is (n_images, 1) to (1, n_images*n_tokens, 1)
+                # in particular, we need to repeat [1, 2] -> [1, 1, 2, 2] instead of [1, 2, 1, 2] (the latter is broadcasting)
+                weight = torch.repeat_interleave(
+                        weight.reshape(1, -1, 1),
+                        repeats = nt, dim = 1).to(dtype=self.dtype, device=self.device)
 
-                    k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond)
-                    k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond)
-                    v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond)
-                    v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond)
-                else:
-                    k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond).repeat(batch_prompt, 1, 1)
-                    k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond).repeat(batch_prompt, 1, 1)
-                    v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond).repeat(batch_prompt, 1, 1)
-                    v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond).repeat(batch_prompt, 1, 1)
-
+                # do we need to pass these through separately ? 
+                # no, they're linear
+                k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond).repeat(b, 1, 1)
+                k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond).repeat(b, 1, 1)
+                v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond).repeat(b, 1, 1)
+                v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond).repeat(b, 1, 1)
+    
+                # batch and weight the condition
                 if weight_type.startswith("linear"):
                     ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0) * weight
                     ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0) * weight
@@ -311,63 +212,28 @@ class CrossAttentionPatch:
                     if weight_type.startswith("channel"):
                         # code by Lvmin Zhang at Stanford University as also seen on Fooocus IPAdapter implementation
                         # please read licensing notes https://github.com/lllyasviel/Fooocus/blob/main/fooocus_extras/ip_adapter.py#L225
-                        ip_v_mean = torch.mean(ip_v, dim=1, keepdim=True)
+                        # we need to slice before we mean
+                        # ip_v is shape [b, n_images * n_tokens, d_attn]
+                        # we want to mean over the tokens of each image
+                        # so we need to slice into [b, n_images, n_tokens, d_attn], mean over tokens, then repeat 
+                        ip_v_slice = ip_v.reshape(b, ni, nt, -1)
+                        ip_v_mean = torch.mean(ip_v_slice, dim=2).repeat(1, nt, 1)
                         ip_v_offset = ip_v - ip_v_mean
                         _, _, C = ip_k.shape
                         channel_penalty = float(C) / 1280.0
                         W = weight * channel_penalty
                         ip_k = ip_k * W
                         ip_v = ip_v_offset + ip_v_mean * W
-
-                out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])           
-                if weight_type.startswith("original"):
-                    out_ip = out_ip * weight
-
-                if mask is not None:
-                    # TODO: needs testing
-                    for rate in [1, 2, 4, 8, 16]:
-                        mask_h = -(-lh//rate) # fancy ceil
-                        mask_w = -(-lw//rate)
-
-                        if mask_h*mask_w == qs:
-                            break
-
-                    # check if using AnimateDiff and sliding context window
-                    if (mask.shape[0] > 1 and ad_params is not None and ad_params["sub_idxs"] is not None):
-                        # if mask length matches or exceeds full_length, just get sub_idx masks, resize, and continue
-                        if mask.shape[0] >= ad_params["full_length"]:
-                            mask_downsample = torch.Tensor(mask[ad_params["sub_idxs"]])
-                            mask_downsample = F.interpolate(mask_downsample.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-                        # otherwise, need to do more to get proper sub_idxs masks
-                        else:
-                            # resize to needed attention size (to save on memory)
-                            mask_downsample = F.interpolate(mask.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-                            # check if mask length matches full_length - if not, make it match
-                            if mask_downsample.shape[0] < ad_params["full_length"]:
-                                mask_downsample = torch.cat((mask_downsample, mask_downsample[-1:].repeat((ad_params["full_length"]-mask_downsample.shape[0], 1, 1))), dim=0)
-                            # if we have too many remove the excess (should not happen, but just in case)
-                            if mask_downsample.shape[0] > ad_params["full_length"]:
-                                mask_downsample = mask_downsample[:ad_params["full_length"]]
-                            # now, select sub_idxs masks
-                            mask_downsample = mask_downsample[ad_params["sub_idxs"]]
-                    # otherwise, perform usual mask interpolation
-                    else:
-                        mask_downsample = F.interpolate(mask.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-
-                    # if we don't have enough masks repeat the last one until we reach the right size
-                    if mask_downsample.shape[0] < batch_prompt:
-                        mask_downsample = torch.cat((mask_downsample, mask_downsample[-1:, :, :].repeat((batch_prompt-mask_downsample.shape[0], 1, 1))), dim=0)
-                    # if we have too many remove the exceeding
-                    elif mask_downsample.shape[0] > batch_prompt:
-                        mask_downsample = mask_downsample[:batch_prompt, :, :]
-                    
-                    # repeat the masks
-                    mask_downsample = mask_downsample.repeat(len(cond_or_uncond), 1, 1)
-                    mask_downsample = mask_downsample.view(mask_downsample.shape[0], -1, 1).repeat(1, 1, out.shape[2])
-
-                    out_ip = out_ip * mask_downsample
-
-                out = out + out_ip
+                # add the condition to the current task
+                k.append(ip_k)
+                v.append(ip_v)
+                # if we are at the end of the group, do the cross attention
+                if i in group_end_indices:
+                    k = torch.cat(k, dim=1)
+                    v = torch.cat(v, dim=1)
+                    out += optimized_attention(q, k, v, extra_options["n_heads"])
+                    k = []
+                    v = []
 
         return out.to(dtype=org_dtype)
 
@@ -414,18 +280,17 @@ class IPAdapterApply:
                 "weight_type": (["original", "linear", "channel penalty"], ),
                 "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
-                "unfold_batch": ("BOOLEAN", { "default": False }),
+                "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
             },
-            "optional": {
-                "attn_mask": ("MASK",),
-            }
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply_ipadapter"
     CATEGORY = "ipadapter"
 
-    def apply_ipadapter(self, ipadapter, model, weight, clip_vision=None, image=None, weight_type="original", noise=None, embeds=None, attn_mask=None, start_at=0.0, end_at=1.0, unfold_batch=False):
+    def apply_ipadapter(self, ipadapter, model, weight, clip_vision=None, image=None,
+                        weight_type="original", noise=None, embeds=None,
+                        start_at=0.0, end_at=1.0, attn_group=0):
         self.dtype = model.model.diffusion_model.dtype
         self.device = comfy.model_management.get_torch_device()
         self.weight = weight
@@ -438,14 +303,13 @@ class IPAdapterApply:
         clip_extra_context_tokens = 16 if self.is_plus else 4
 
         if embeds is not None:
-            embeds = torch.unbind(embeds)
-            clip_embed = embeds[0].cpu()
-            clip_embed_zeroed = embeds[1].cpu()
+            (clip_embed, clip_embed_weights, clip_embed_zeroed) = embeds
         else:
             if image.shape[1] != image.shape[2]:
                 print("\033[33mINFO: the IPAdapter reference image is not a square, CLIPImageProcessor will resize and crop it at the center. If the main focus of the picture is not in the middle the result might not be what you are expecting.\033[0m")
 
             clip_embed = clip_vision.encode_image(image)
+            clip_embed_weights = torch.ones(clip_embed.shape[0], 1, 1).to(self.device, dtype=self.dtype)
             neg_image = image_add_noise(image, noise) if noise > 0 else None
             
             if self.is_plus:
@@ -482,25 +346,21 @@ class IPAdapterApply:
 
         work_model = model.clone()
 
-        if attn_mask is not None:
-            attn_mask = attn_mask.to(self.device)
-
         sigma_start = model.model.model_sampling.percent_to_sigma(start_at)
         sigma_end = model.model.model_sampling.percent_to_sigma(end_at)
 
         patch_kwargs = {
             "number": 0,
-            "weight": self.weight,
+            "weight": self.weight * clip_embed_weights,
             "ipadapter": self.ipadapter,
             "device": self.device,
             "dtype": self.dtype,
             "cond": image_prompt_embeds,
             "uncond": uncond_image_prompt_embeds,
             "weight_type": weight_type,
-            "mask": attn_mask,
             "sigma_start": sigma_start,
             "sigma_end": sigma_end,
-            "unfold_batch": unfold_batch,
+            "attn_group": attn_group,
         }
 
         if not self.is_sdxl:
@@ -534,7 +394,7 @@ class PrepImageForClipVision:
         return {"required": {
             "image": ("IMAGE",),
             "interpolation": (["LANCZOS", "BICUBIC", "HAMMING", "BILINEAR", "BOX", "NEAREST"],),
-            "crop_position": (["top", "bottom", "left", "right", "center", "pad"],),
+            "crop_position": (["top", "bottom", "left", "right", "center", "pad", "stretch"],),
             "sharpening": ("FLOAT", {"default": 0.0, "min": 0, "max": 1, "step": 0.05}),
             },
         }
@@ -555,7 +415,7 @@ class PrepImageForClipVision:
             pad_t = (target_length - oh) // 2
             pad_b = (target_length - oh) - pad_t
             output = F.pad(output, (pad_l, pad_r, pad_t, pad_b), value=0, mode="constant")
-        else:
+        elif "stretch" not in crop_position:
             crop_size = min(oh, ow)
             x = (ow-crop_size) // 2
             y = (oh-crop_size) // 2
@@ -614,15 +474,6 @@ class IPAdapterEncoder:
     CATEGORY = "ipadapter"
 
     def preprocess(self, clip_vision, image_1, ipadapter_plus, noise, weight_1, image_2=None, image_3=None, image_4=None, weight_2=1.0, weight_3=1.0, weight_4=1.0):
-        weight_1 *= (0.1 + (weight_1 - 0.1))
-        weight_1 = 1.19e-05 if weight_1 <= 1.19e-05 else weight_1
-        weight_2 *= (0.1 + (weight_2 - 0.1))
-        weight_2 = 1.19e-05 if weight_2 <= 1.19e-05 else weight_2
-        weight_3 *= (0.1 + (weight_3 - 0.1))
-        weight_3 = 1.19e-05 if weight_3 <= 1.19e-05 else weight_3
-        weight_4 *= (0.1 + (weight_4 - 0.1))
-        weight_5 = 1.19e-05 if weight_4 <= 1.19e-05 else weight_4
-
         image = image_1
         weight = [weight_1]*image_1.shape[0]
         
@@ -658,13 +509,11 @@ class IPAdapterEncoder:
             else:
                 clip_embed_zeroed = torch.zeros_like(clip_embed)
 
-        if any(e != 1.0 for e in weight):
-            weight = torch.tensor(weight).unsqueeze(-1) if not ipadapter_plus else torch.tensor(weight).unsqueeze(-1).unsqueeze(-1)
-            clip_embed = clip_embed * weight
+        weight = torch.tensor(weight).unsqueeze(-1) if not ipadapter_plus else torch.tensor(weight).unsqueeze(-1).unsqueeze(-1)
         
-        output = torch.stack((clip_embed, clip_embed_zeroed))
+        output = (clip_embed, weight, clip_embed_zeroed)
 
-        return( output, )
+        return ( output, )
 
 class IPAdapterApplyEncoded(IPAdapterApply):
     @classmethod
@@ -678,10 +527,7 @@ class IPAdapterApplyEncoded(IPAdapterApply):
                 "weight_type": (["original", "linear", "channel penalty"], ),
                 "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
-                "unfold_batch": ("BOOLEAN", { "default": False }),
-            },
-            "optional": {
-                "attn_mask": ("MASK",),
+                "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
             }
         }
 
@@ -727,23 +573,3 @@ class IPAdapterLoadEmbeds:
         output = torch.load(path).cpu()
 
         return (output, )
-
-NODE_CLASS_MAPPINGS = {
-    "IPAdapterModelLoader": IPAdapterModelLoader,
-    "IPAdapterApply": IPAdapterApply,
-    "IPAdapterApplyEncoded": IPAdapterApplyEncoded,
-    "PrepImageForClipVision": PrepImageForClipVision,
-    "IPAdapterEncoder": IPAdapterEncoder,
-    "IPAdapterSaveEmbeds": IPAdapterSaveEmbeds,
-    "IPAdapterLoadEmbeds": IPAdapterLoadEmbeds,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "IPAdapterModelLoader": "Load IPAdapter Model",
-    "IPAdapterApply": "Apply IPAdapter",
-    "IPAdapterApplyEncoded": "Apply IPAdapter from Encoded",
-    "PrepImageForClipVision": "Prepare Image For Clip Vision",
-    "IPAdapterEncoder": "Encode IPAdapter Image",
-    "IPAdapterSaveEmbeds": "Save IPAdapter Embeds",
-    "IPAdapterLoadEmbeds": "Load IPAdapter Embeds",
-}
