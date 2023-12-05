@@ -309,7 +309,7 @@ class IPAdapterApply:
                 print("\033[33mINFO: the IPAdapter reference image is not a square, CLIPImageProcessor will resize and crop it at the center. If the main focus of the picture is not in the middle the result might not be what you are expecting.\033[0m")
 
             clip_embed = clip_vision.encode_image(image)
-            clip_embed_weights = torch.ones(clip_embed.shape[0], 1, 1).to(self.device, dtype=self.dtype)
+            clip_embed_weights = torch.ones(image.shape[0], 1, 1).to(self.device, dtype=self.dtype)
             neg_image = image_add_noise(image, noise) if noise > 0 else None
             
             if self.is_plus:
