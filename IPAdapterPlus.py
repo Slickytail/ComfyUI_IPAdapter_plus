@@ -175,8 +175,8 @@ class CrossAttentionPatch:
             b = q.shape[0] // len(cond_or_uncond)
             out = 0
 
-            # if text is separate from image, do the text group first
-            if tasks[0][7] != 0:
+            # if text is separate from image, or if there are no images, do the text group first
+            if not len(tasks) or tasks[0][7] != 0:
                 out = optimized_attention(q, context_attn2, value_attn2, extra_options["n_heads"])
             else:
                 k = [context_attn2]
