@@ -167,7 +167,7 @@ class CrossAttentionPatch:
             # sort tasks by groups, so that once each group is done we can call crossattention and free memory
             tasks.sort(key=lambda x: x[7])
             # get the last index of each group
-            group_end_indices = [i for i, x in enumerate(tasks[:-2]) if x[7] != tasks[i+1][7]] + [len(tasks)-1]
+            group_end_indices = [i for i, x in enumerate(tasks[:-1]) if x[7] != tasks[i+1][7]] + [len(tasks)-1]
 
             q = n
             k = []
