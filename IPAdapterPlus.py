@@ -188,7 +188,7 @@ class CrossAttentionPatch:
                 (ni, nt, _) = cond.shape
                 cond = cond.reshape(1, -1, cond.shape[-1])
                 uncond = uncond.reshape(1, -1, uncond.shape[-1])
-                # we also need to reshape the weight, which is (n_images, 1) to (1, n_images*n_tokens, 1)
+                # we also need to reshape the weight, which is (n_images) to (1, n_images*n_tokens, 1)
                 # in particular, we need to repeat [1, 2] -> [1, 1, 2, 2] instead of [1, 2, 1, 2] (the latter is broadcasting)
                 weight = torch.repeat_interleave(
                         weight.reshape(1, -1, 1),
@@ -213,11 +213,11 @@ class CrossAttentionPatch:
                         # code by Lvmin Zhang at Stanford University as also seen on Fooocus IPAdapter implementation
                         # please read licensing notes https://github.com/lllyasviel/Fooocus/blob/main/fooocus_extras/ip_adapter.py#L225
                         # we need to slice before we mean
-                        # ip_v is shape [b, n_images * n_tokens, d_attn]
+                        # ip_v is shape [b * c, n_images * n_tokens, d_attn]
                         # we want to mean over the tokens of each image
-                        # so we need to slice into [b, n_images, n_tokens, d_attn], mean over tokens, then repeat 
-                        ip_v_slice = ip_v.reshape(b, ni, nt, -1)
-                        ip_v_mean = torch.mean(ip_v_slice, dim=2).repeat(1, nt, 1)
+                        # so we need to slice into [b*c, n_images, n_tokens, d_attn], mean over tokens, then repeat 
+                        ip_v_slice = ip_v.reshape(q.shape[0], ni, nt, -1)
+                        ip_v_mean = torch.repeat_interleave(torch.mean(ip_v_slice, dim=2), repeats=nt, dim=1)
                         ip_v_offset = ip_v - ip_v_mean
                         _, _, C = ip_k.shape
                         channel_penalty = float(C) / 1280.0
@@ -303,13 +303,13 @@ class IPAdapterApply:
         clip_extra_context_tokens = 16 if self.is_plus else 4
 
         if embeds is not None:
-            (clip_embed, clip_embed_weights, clip_embed_zeroed) = embeds
+            (clip_embed, clip_embed_zeroed, clip_embed_weights) = embeds
         else:
             if image.shape[1] != image.shape[2]:
                 print("\033[33mINFO: the IPAdapter reference image is not a square, CLIPImageProcessor will resize and crop it at the center. If the main focus of the picture is not in the middle the result might not be what you are expecting.\033[0m")
 
             clip_embed = clip_vision.encode_image(image)
-            clip_embed_weights = torch.ones(image.shape[0], 1, 1).to(self.device, dtype=self.dtype)
+            clip_embed_weights = torch.ones(image.shape[0]).to(self.device, dtype=self.dtype)
             neg_image = image_add_noise(image, noise) if noise > 0 else None
             
             if self.is_plus:
@@ -509,9 +509,8 @@ class IPAdapterEncoder:
             else:
                 clip_embed_zeroed = torch.zeros_like(clip_embed)
 
-        weight = torch.tensor(weight).unsqueeze(-1) if not ipadapter_plus else torch.tensor(weight).unsqueeze(-1).unsqueeze(-1)
-        
-        output = (clip_embed, weight, clip_embed_zeroed)
+        weight = torch.tensor(weight)
+        output = (clip_embed, clip_embed_zeroed, weight)
 
         return ( output, )
 
