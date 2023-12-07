@@ -275,11 +275,11 @@ class IPAdapterApply:
                 "clip_vision": ("CLIP_VISION",),
                 "image": ("IMAGE",),
                 "model": ("MODEL", ),
-                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.05 }),
+                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.01 }),
                 "noise": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "weight_type": (["original", "linear", "channel penalty"], ),
-                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
-                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
+                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
             },
         }
@@ -463,9 +463,9 @@ class IPAdapterEncoder:
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
-                "weight_2": ("FLOAT", { "default": 1.0, "min": 0, "max": 1.0, "step": 0.01 }),
-                "weight_3": ("FLOAT", { "default": 1.0, "min": 0, "max": 1.0, "step": 0.01 }),
-                "weight_4": ("FLOAT", { "default": 1.0, "min": 0, "max": 1.0, "step": 0.01 }),
+                "weight_2": ("FLOAT", { "default": 1.0, "min": -1.0, "max": 2.0, "step": 0.01 }),
+                "weight_3": ("FLOAT", { "default": 1.0, "min": -1.0, "max": 2.0, "step": 0.01 }),
+                "weight_4": ("FLOAT", { "default": 1.0, "min": -1.0, "max": 2.0, "step": 0.01 }),
             }
         }
 
@@ -523,10 +523,10 @@ class IPAdapterApplyEncoded(IPAdapterApply):
                 "ipadapter": ("IPADAPTER", ),
                 "embeds": ("EMBEDS",),
                 "model": ("MODEL", ),
-                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.05 }),
+                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.01 }),
                 "weight_type": (["original", "linear", "channel penalty"], ),
-                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
-                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
+                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
             }
         }
