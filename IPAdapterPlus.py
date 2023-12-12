@@ -202,28 +202,27 @@ class CrossAttentionPatch:
                 v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond).repeat(b, 1, 1)
     
                 # batch and weight the condition
-                if weight_type.startswith("linear"):
-                    ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0) * weight
-                    ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0) * weight
-                else:
-                    ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0)
-                    ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
-
-                    if weight_type.startswith("channel"):
-                        # code by Lvmin Zhang at Stanford University as also seen on Fooocus IPAdapter implementation
-                        # please read licensing notes https://github.com/lllyasviel/Fooocus/blob/main/fooocus_extras/ip_adapter.py#L225
-                        # we need to slice before we mean
-                        # ip_v is shape [b * c, n_images * n_tokens, d_attn]
-                        # we want to mean over the tokens of each image
-                        # so we need to slice into [b*c, n_images, n_tokens, d_attn], mean over tokens, then repeat 
-                        ip_v_slice = ip_v.reshape(q.shape[0], ni, nt, -1)
-                        ip_v_mean = torch.repeat_interleave(torch.mean(ip_v_slice, dim=2), repeats=nt, dim=1)
-                        ip_v_offset = ip_v - ip_v_mean
-                        _, _, C = ip_k.shape
-                        channel_penalty = float(C) / 1280.0
-                        W = weight * channel_penalty
-                        ip_k = ip_k * W
-                        ip_v = ip_v_offset + ip_v_mean * W
+                ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0)
+                ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
+                if weight_type.startswith("key"):
+                    ip_k *= weight
+                elif weight_type.startswith("value"):
+                    ip_v *= weight
+                elif weight_type.startswith("channel"):
+                    # code by Lvmin Zhang at Stanford University as also seen on Fooocus IPAdapter implementation
+                    # please read licensing notes https://github.com/lllyasviel/Fooocus/blob/main/fooocus_extras/ip_adapter.py#L225
+                    # we need to slice before we mean
+                    # ip_v is shape [b * c, n_images * n_tokens, d_attn]
+                    # we want to mean over the tokens of each image
+                    # so we need to slice into [b*c, n_images, n_tokens, d_attn], mean over tokens, then repeat 
+                    ip_v_slice = ip_v.reshape(q.shape[0], ni, nt, -1)
+                    ip_v_mean = torch.repeat_interleave(torch.mean(ip_v_slice, dim=2), repeats=nt, dim=1)
+                    ip_v_offset = ip_v - ip_v_mean
+                    _, _, C = ip_k.shape
+                    channel_penalty = float(C) / 1280.0
+                    W = weight * channel_penalty
+                    ip_k = ip_k * W
+                    ip_v = ip_v_offset + ip_v_mean * W
                 # add the condition to the current task
                 k.append(ip_k)
                 v.append(ip_v)
@@ -277,7 +276,7 @@ class IPAdapterApply:
                 "model": ("MODEL", ),
                 "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.01 }),
                 "noise": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
-                "weight_type": (["original", "linear", "channel penalty"], ),
+                "weight_type": (["key", "value", "channel penalty"], ),
                 "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
@@ -289,7 +288,7 @@ class IPAdapterApply:
     CATEGORY = "ipadapter"
 
     def apply_ipadapter(self, ipadapter, model, weight, clip_vision=None, image=None,
-                        weight_type="original", noise=None, embeds=None,
+                        weight_type="channel penalty", noise=None, embeds=None,
                         start_at=0.0, end_at=1.0, attn_group=0):
         self.dtype = model.model.diffusion_model.dtype
         self.device = comfy.model_management.get_torch_device()
@@ -523,7 +522,7 @@ class IPAdapterApplyEncoded(IPAdapterApply):
                 "embeds": ("EMBEDS",),
                 "model": ("MODEL", ),
                 "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.01 }),
-                "weight_type": (["original", "linear", "channel penalty"], ),
+                "weight_type": (["key", "value", "channel penalty"], ),
                 "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01 }),
                 "attn_group": ("INT", { "default": 0, "min": 0, "max": 100, "step": 1}),
