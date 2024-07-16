@@ -433,7 +433,7 @@ class PrepImageForClipVision:
             # crop
             output = output[:, :, y:y2, x:x2]
 
-        # resize (apparently PIL resize is better than tourchvision interpolate)
+        # resize (apparently PIL resize is better than torchvision interpolate)
         imgs = []
         for i in range(output.shape[0]):
             img = TT.ToPILImage()(output[i])
@@ -447,6 +447,26 @@ class PrepImageForClipVision:
         output = output.permute([0,2,3,1])
 
         return (output,)
+
+class CLIPVisionEmbedMean:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "embeds": ("EMBED",)
+        }}
+
+    RETURN_TYPES = ("EMBED",)
+    FUNCTION = "mean"
+    CATEGORY = "ipadapter"
+
+    def mean(self, embeds):
+        (embed, zeroed, weight) = embeds
+        embed = embed.mean(dim=0, keepdim=True)
+        zeroed = zeroed.mean(dim=0, keepdim=True)
+        weight = weight.mean(dim=0, keepdim=True)
+        return ((embed, zeroed, weight),)
+
+
 
 class IPAdapterEncoder:
     @classmethod
@@ -571,3 +591,17 @@ class IPAdapterLoadEmbeds:
         output = torch.load(path).cpu()
 
         return (output, )
+
+class CLIPVisionSimilarity:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image_1": ("CLIP_VISION_OUTPUT",), "image_2": ("CLIP_VISION_OUTPUT",)}}
+
+    RETURN_TYPES = ("FLOAT",)
+    FUNCTION = "similarity"
+    CATEGORY = "_for_testing"
+
+    def similarity(self, image_1, image_2):
+        sim = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+        similarity = sim(image_1["image_embeds"], image_2["image_embeds"])
+        return (similarity,)

@@ -1,5 +1,5 @@
 from .IPAdapterPlus import IPAdapterModelLoader, IPAdapterApply, IPAdapterApplyEncoded, PrepImageForClipVision
-from .IPAdapterPlus import IPAdapterEncoder, IPAdapterSaveEmbeds, IPAdapterLoadEmbeds
+from .IPAdapterPlus import IPAdapterEncoder, IPAdapterSaveEmbeds, IPAdapterLoadEmbeds, CLIPVisionEmbedMean
 
 NODE_CLASS_MAPPINGS = {
     "IPAdapterModelLoader": IPAdapterModelLoader,
@@ -9,6 +9,7 @@ NODE_CLASS_MAPPINGS = {
     "IPAdapterEncoder": IPAdapterEncoder,
     "IPAdapterSaveEmbeds": IPAdapterSaveEmbeds,
     "IPAdapterLoadEmbeds": IPAdapterLoadEmbeds,
+    "CLIPVisionEmbedMean": CLIPVisionEmbedMean,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -19,6 +20,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IPAdapterEncoder": "Encode IPAdapter Image",
     "IPAdapterSaveEmbeds": "Save IPAdapter Embeds",
     "IPAdapterLoadEmbeds": "Load IPAdapter Embeds",
+    "CLIPVisionEmbedMean": "Mean Clip Vision Embeds",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
