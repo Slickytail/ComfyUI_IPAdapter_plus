@@ -452,10 +452,10 @@ class CLIPVisionEmbedMean:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "embeds": ("EMBED",)
+            "embeds": ("EMBEDS",)
         }}
 
-    RETURN_TYPES = ("EMBED",)
+    RETURN_TYPES = ("EMBEDS",)
     FUNCTION = "mean"
     CATEGORY = "ipadapter"
 
