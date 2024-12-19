@@ -28,14 +28,14 @@ class Attn2Replace:
         # merge some of the adapters into the textual attention call
         # todo, should we instead modify a copy of k and v, so that we can later pass the original one to the other adapters?
         for callback, args in active_adapters:
-            if args["merge_with_text"]:
+            if args.get("merge_with_text", False):
                 k_ip, v_ip = callback(None, q, k, v, extra_options, **args)
                 k = torch.cat([k, k_ip], dim=1)
                 v = torch.cat([v, v_ip], dim=1)
         out = optimized_attention(q, k, v, extra_options["n_heads"])
 
         for callback, args in active_adapters:
-            if args["merge_with_text"]:
+            if args.get("merge_with_text", False):
                 continue
             out = out + callback(out, q, k, v, extra_options, **args)
 
