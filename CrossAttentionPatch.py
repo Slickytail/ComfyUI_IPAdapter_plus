@@ -1,12 +1,16 @@
-import torch
+from typing import Callable, Any
 import math
+import torch
 import torch.nn.functional as F
 from comfy.ldm.modules.attention import optimized_attention
 from .utils import tensor_to_size
 
 class Attn2Replace:
+    callback: list[Callable]
+    kwargs: list[dict[str, Any]]
+
     def __init__(self, callback=None, **kwargs):
-        self.callback = [callback]
+        self.callback = [callback] # type: ignore
         self.kwargs = [kwargs]
 
     def add(self, callback, **kwargs):
@@ -17,17 +21,27 @@ class Attn2Replace:
             setattr(self, key, value)
 
     def __call__(self, q, k, v, extra_options):
-        dtype = q.dtype
-        out = optimized_attention(q, k, v, extra_options["n_heads"])
         sigma = extra_options["sigmas"].detach().cpu()[0].item() if 'sigmas' in extra_options else 999999999.9
+        active_adapters = [(cb, args) for cb, args in zip(self.callback, self.kwargs) if args["sigma_end"] <= sigma <= args["sigma_start"]]
 
-        for i, callback in enumerate(self.callback):
-            if sigma <= self.kwargs[i]["sigma_start"] and sigma >= self.kwargs[i]["sigma_end"]:
-                out = out + callback(out, q, k, v, extra_options, **self.kwargs[i])
+        dtype = q.dtype
+        # merge some of the adapters into the textual attention call
+        # todo, should we instead modify a copy of k and v, so that we can later pass the original one to the other adapters?
+        for callback, args in active_adapters:
+            if args["merge_with_text"]:
+                k_ip, v_ip = callback(None, q, k, v, extra_options, **args)
+                k = torch.cat([k, k_ip], dim=1)
+                v = torch.cat([v, v_ip], dim=1)
+        out = optimized_attention(q, k, v, extra_options["n_heads"])
+
+        for callback, args in active_adapters:
+            if args["merge_with_text"]:
+                continue
+            out = out + callback(out, q, k, v, extra_options, **args)
 
         return out.to(dtype=dtype)
 
-def ipadapter_attention(out, q, k, v, extra_options, module_key='', ipadapter=None, weight=1.0, cond=None, cond_alt=None, uncond=None, weight_type="linear", mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False, embeds_scaling='V only', **kwargs):
+def ipadapter_attention(out, q, k, v, extra_options, module_key='', ipadapter=None, weight=1.0, cond=None, cond_alt=None, uncond=None, weight_type="linear", mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False, embeds_scaling='V only', merge_with_text=False, **kwargs):
     dtype = q.dtype
     cond_or_uncond = extra_options["cond_or_uncond"]
     block_type = extra_options["block"][0]
@@ -152,22 +166,21 @@ def ipadapter_attention(out, q, k, v, extra_options, module_key='', ipadapter=No
         ip_k = ip_k * weight
         ip_v_mean = torch.mean(ip_v, dim=1, keepdim=True)
         ip_v = (ip_v - ip_v_mean) + ip_v_mean * weight
-        out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
-        del ip_v_mean
     elif embeds_scaling == 'K+V w/ C penalty':
         scaling = float(ip_k.shape[2]) / 1280.0
         weight = weight * scaling
         ip_k = ip_k * weight
         ip_v = ip_v * weight
-        out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
     elif embeds_scaling == 'K+V':
         ip_k = ip_k * weight
         ip_v = ip_v * weight
-        out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
     else:
-        #ip_v = ip_v * weight
-        out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
-        out_ip = out_ip * weight # I'm doing this to get the same results as before
+        ip_v = ip_v * weight
+
+    if merge_with_text:
+        return (ip_k, ip_v)
+
+    out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
 
     if mask is not None:
         mask_h = oh / math.sqrt(oh * ow / seq_len)
