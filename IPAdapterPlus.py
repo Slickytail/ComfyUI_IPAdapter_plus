@@ -745,7 +745,7 @@ class IPAdapterAdvanced:
                 "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
                 "embeds_scaling": (['V only', 'K+V', 'K+V w/ C penalty', 'K+mean(V) w/ C penalty'], ),
-                "merge_with_text": ("BOOL",)
+                "merge_with_text": ([False, True],)
             },
             "optional": {
                 "image_negative": ("IMAGE",),
